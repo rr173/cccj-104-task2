@@ -23,6 +23,18 @@ class ChunkOut(BaseModel):
     size: int
 
 
+class Envelope(BaseModel):
+    """A signed document: canonical-serializable metadata + detached sigs."""
+    metadata: dict[str, Any]
+    signatures: list[dict[str, str]]
+
+
+class TrustBundle(BaseModel):
+    """Root-chain links above the device's reported root version."""
+    latest_root_version: int
+    root_chain: list[Envelope] = Field(default_factory=list)
+
+
 class OfferOut(BaseModel):
     assignment_id: str
     campaign_id: str
@@ -35,6 +47,9 @@ class OfferOut(BaseModel):
     chunks: list[ChunkOut]
     finalize_only: bool
     install_state: str
+    # Signed release envelope the device must validate before the critical
+    # write phase (None only defensively — unsigned images are never offered).
+    release: Envelope | None = None
 
 
 class CheckInResponse(BaseModel):
@@ -42,11 +57,14 @@ class CheckInResponse(BaseModel):
     offered: bool
     reason: str | None = None
     offer: OfferOut | None = None
+    trust: TrustBundle | None = None
     server_time: datetime
 
 
 class EventIn(BaseModel):
-    assignment_id: str
+    # Optional only for telemetry receipts (e.g. release_rejected) that can
+    # occur before/without an offer; FSM-moving events still require it.
+    assignment_id: str | None = None
     event_type: str
     idempotency_key: str = Field(min_length=8, max_length=120)
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -115,6 +133,21 @@ class BatchOut(BaseModel):
 class BatchActionIn(BaseModel):
     action: Literal["activate", "pause", "halt", "resume", "complete"]
     force: bool = False
+
+
+# ----- offline signing: root chain + release publication -----
+class RootPublishIn(BaseModel):
+    metadata: dict[str, Any]
+    signatures: list[dict[str, str]]
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class ReleasePublishIn(BaseModel):
+    # Optional cross-check; the release is bound to the image by digest.
+    image_id: str | None = None
+    metadata: dict[str, Any]
+    signatures: list[dict[str, str]]
+    idempotency_key: str = Field(min_length=8, max_length=120)
 
 
 class DeviceOut(BaseModel):

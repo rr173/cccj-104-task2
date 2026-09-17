@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import trust as trustlib  # noqa: E402
 from client import SimDevice  # noqa: E402
 
 
@@ -49,10 +50,106 @@ def _blob(seed: bytes, size: int = 200) -> bytes:
     return bytes(out[:size])
 
 
+# --------------------------------------------------------------------------- #
+# Offline signing kit — private keys never touch the service DB
+# --------------------------------------------------------------------------- #
+class TrustKit:
+    """Key material for tests: two root keys (rotations), two release keys
+    (revocation). The service only ever sees the public halves inside signed
+    metadata, exactly like a real offline signer."""
+
+    def __init__(self):
+        self.root_priv, self.root_pub = trustlib.generate_keypair()
+        self.root2_priv, self.root2_pub = trustlib.generate_keypair()
+        self.root3_priv, self.root3_pub = trustlib.generate_keypair()
+        self.rel_priv, self.rel_pub = trustlib.generate_keypair()
+        self.rel2_priv, self.rel2_pub = trustlib.generate_keypair()
+
+    def keyset(self, root_pub, release_pubs, revoked=()):
+        keys = {trustlib.key_id(root_pub): trustlib.key_entry(root_pub, ["root"])}
+        for p in release_pubs:
+            keys[trustlib.key_id(p)] = trustlib.key_entry(
+                p, ["release"], revoked=p in revoked
+            )
+        return keys
+
+
+def root_envelope(version, keys, sign_with, expires=None):
+    """Build a signed root-metadata envelope entirely offline."""
+    meta = trustlib.root_metadata(version, keys, expires or trustlib.iso_after(30 * 86400))
+    return {
+        "metadata": meta,
+        "signatures": [trustlib.sign_envelope(meta, p) for p in sign_with],
+    }
+
+
 class AdminHelper:
     def __init__(self, client):
         self.c = client
+        self.kit: TrustKit | None = None
+        self._counters: dict[str, int] = {}
 
+    # ----- trust root -----
+    def ensure_root(self) -> TrustKit:
+        """Bootstrap root v1 (self-signed) once per test."""
+        if self.kit is None:
+            self.kit = TrustKit()
+            env = root_envelope(
+                1,
+                self.kit.keyset(self.kit.root_pub, [self.kit.rel_pub, self.kit.rel2_pub]),
+                [self.kit.root_priv],
+            )
+            r = self.c.post(
+                "/api/admin/roots",
+                json={**env, "idempotency_key": f"root-v1-{uuid.uuid4().hex[:12]}"},
+            )
+            assert r.status_code == 200, r.text
+        return self.kit
+
+    def rotate_root(self, version, keys, sign_with, *, expires=None, expect=200):
+        env = root_envelope(version, keys, sign_with, expires)
+        r = self.c.post(
+            "/api/admin/roots",
+            json={**env, "idempotency_key": f"root-v{version}-{uuid.uuid4().hex[:12]}"},
+        )
+        if expect is not None:
+            assert r.status_code == expect, r.text
+        return r
+
+    # ----- releases -----
+    def post_release(self, meta, sigs, *, image_id=None, idem=None, expect=200):
+        r = self.c.post(
+            "/api/admin/releases",
+            json={
+                "image_id": image_id,
+                "metadata": meta,
+                "signatures": sigs,
+                "idempotency_key": idem or f"rel-{uuid.uuid4().hex}",
+            },
+        )
+        if expect is not None:
+            assert r.status_code == expect, r.text
+        return r
+
+    def publish_release(
+        self, img, *, counter=None, expires=None, sign_priv=None, idem=None, expect=200
+    ):
+        self.ensure_root()
+        model = img["model"]
+        if counter is None:
+            counter = self._counters.get(model, 0) + 1
+        self._counters[model] = max(self._counters.get(model, 0), counter)
+        meta = trustlib.release_metadata(
+            model=model,
+            version=img["version"],
+            artifact_sha256=img["sha256"],
+            security_counter=counter,
+            expires=expires or trustlib.iso_after(30 * 86400),
+        )
+        sigs = [trustlib.sign_envelope(meta, sign_priv or self.kit.rel_priv)]
+        return self.post_release(meta, sigs, image_id=img["id"], idem=idem, expect=expect)
+
+    # ----- images / campaigns / batches -----
     def upload_image(
         self,
         *,
@@ -62,6 +159,8 @@ class AdminHelper:
         max_bootloader="1.99.0",
         blob_seed=b"FW-2.0",
         size=200,
+        auto_release=True,
+        counter=None,
     ):
         blob = _blob(blob_seed, size)
         r = self.c.post(
@@ -75,7 +174,10 @@ class AdminHelper:
             files={"file": ("fw.bin", io.BytesIO(blob), "application/octet-stream")},
         )
         assert r.status_code == 201, r.text
-        return r.json(), blob
+        img = r.json()
+        if auto_release:
+            self.publish_release(img, counter=counter)
+        return img, blob
 
     def campaign(self, image_id, name=None):
         r = self.c.post(
@@ -169,6 +271,8 @@ def make_device(client, tmp_path):
         d.slots = {"A": d.facts["current_version"], "B": None}
         d.active_slot = "A"
         d._offer = None
+        d._clock = kw.get("clock")  # tests may pin/advance the device clock
+        d._trust = None
         d._idem = d._load_idem()
         d._load_persisted_state()
         return d

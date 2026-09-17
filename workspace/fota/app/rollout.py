@@ -15,11 +15,13 @@ import json
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import publishing
 from .models import (
     ALLOWED_TRANSITIONS,
     BATCH_ACTIVE,
@@ -57,6 +59,7 @@ REASON_BATCH_PAUSED = "batch_paused"
 REASON_BATCH_HALTED = "batch_halted"
 REASON_QUOTA_FULL = "quota_full"
 REASON_TERMINAL = "terminal"
+REASON_NO_SIGNED_RELEASE = "no_signed_release"
 
 # Device receipts that move the FSM (telemetry-only events have no state entry).
 EVENT_TO_STATE: dict[str, str] = {
@@ -66,7 +69,10 @@ EVENT_TO_STATE: dict[str, str] = {
     STATE_INSTALLED: STATE_INSTALLED,
     STATE_FAILED: STATE_FAILED,
 }
-TELEMETRY_EVENTS = frozenset({"download_started", "rollback_complete", "info"})
+# `release_rejected` is the durable, idempotent failure receipt a device posts
+# when signed metadata/content fails validation before the critical write
+# phase. It never moves the FSM: the device keeps its seat and its boot slot.
+TELEMETRY_EVENTS = frozenset({"download_started", "rollback_complete", "info", "release_rejected"})
 KNOWN_EVENTS = frozenset(EVENT_TO_STATE) | TELEMETRY_EVENTS
 
 
@@ -96,6 +102,9 @@ class Offer:
     size: int
     chunk_size: int
     chunks: list[dict] = field(default_factory=list)
+    # Signed release envelope (canonical metadata + signatures). The device
+    # MUST validate it against its trust store before the critical write phase.
+    release: dict | None = None
     # True when the device is already in/through the critical region: the
     # client must finish the pending install and then report. Never abort.
     finalize_only: bool = False
@@ -107,6 +116,9 @@ class CheckInResult:
     device: Device
     offer: Offer | None = None
     reason: str | None = None
+    # Root-chain links the device needs to catch up to the service's current
+    # trust root (always present, even when nothing is offered).
+    trust: dict | None = None
 
 
 # ----------------------------------------------------------------------------- #
@@ -144,6 +156,7 @@ def _manifest_chunks(image: Image) -> list[dict]:
 
 
 def _make_offer(db: Session, device: Device, assignment: Assignment, image: Image) -> Offer:
+    rel = publishing.release_for_image(db, image.id)
     return Offer(
         assignment_id=assignment.id,
         campaign_id=assignment.campaign_id,
@@ -154,6 +167,9 @@ def _make_offer(db: Session, device: Device, assignment: Assignment, image: Imag
         size=image.size,
         chunk_size=image.chunk_size,
         chunks=_manifest_chunks(image),
+        # The signed release envelope travels with the offer; the device
+        # re-verifies it offline before entering the critical write phase.
+        release=publishing.release_envelope(rel) if rel is not None else None,
         finalize_only=assignment.install_state in PAST_DOWNLOAD_STATES,
         install_state=assignment.install_state,
     )
@@ -198,13 +214,18 @@ def _candidate_batches(db: Session, device: Device) -> list[tuple[Batch, Campaig
 # ----------------------------------------------------------------------------- #
 # Check-in
 # ----------------------------------------------------------------------------- #
-def check_in(db: Session, device: Device) -> CheckInResult:
+def check_in(db: Session, device: Device, device_root_version: int = 0) -> CheckInResult:
     # Serialize the whole read-modify-write: prevents two concurrent check-ins
     # of the same device from racing, and keeps per-process seat claims atomic.
     # The UNIQUE(device,campaign) constraint remains the durable backstop.
     with _claim_lock:
         device.last_seen = utcnow()
         db.add(device)
+
+        # Root-chain links above the device's reported root version: a device
+        # that slept through several rotations catches up in one wake-up. The
+        # bundle rides along on every check-in, offered or not.
+        trust = publishing.trust_bundle(db, max(0, device_root_version))
 
         # Existing ledger rows for this device get first say (pause/finish safety).
         existing = db.scalars(
@@ -222,30 +243,38 @@ def check_in(db: Session, device: Device) -> CheckInResult:
             if asg.install_state in CRITICAL_STATES:
                 # Flash writes in progress: always allow finishing + reporting.
                 db.commit()
-                return CheckInResult(device, _make_offer(db, device, asg, image))
+                return CheckInResult(device, _make_offer(db, device, asg, image), trust=trust)
             if batch.state == BATCH_PAUSED:
                 db.commit()
-                return CheckInResult(device, None, REASON_BATCH_PAUSED)
+                return CheckInResult(device, None, REASON_BATCH_PAUSED, trust=trust)
             if batch.state == BATCH_HALTED:
                 db.commit()
-                return CheckInResult(device, None, REASON_BATCH_HALTED)
+                return CheckInResult(device, None, REASON_BATCH_HALTED, trust=trust)
             if batch.state == BATCH_ACTIVE:
                 # assigned/downloading/downloaded: serve manifest so the client
                 # resumes verified blocks or proceeds to install.
                 db.commit()
-                return CheckInResult(device, _make_offer(db, device, asg, image))
+                return CheckInResult(device, _make_offer(db, device, asg, image), trust=trust)
 
         # No live assignment: claim a seat in an active batch.
-        return _claim_new(db, device)
+        return _claim_new(db, device, trust)
 
 
-def _claim_new(db: Session, device: Device) -> CheckInResult:
+def _claim_new(db: Session, device: Device, trust: dict) -> CheckInResult:
     candidates = _candidate_batches(db, device)
     if not candidates:
         db.commit()
-        return CheckInResult(device, None, REASON_NO_CAMPAIGN)
+        return CheckInResult(device, None, REASON_NO_CAMPAIGN, trust=trust)
 
+    now = datetime.now(timezone.utc)
+    saw_unsigned = False
     for batch, _campaign, image in candidates:
+        rel = publishing.release_for_image(db, image.id)
+        if not publishing.release_currently_valid(rel, now):
+            # Fail closed: an image without a valid signed release is never
+            # offered, even if a compatible campaign is active.
+            saw_unsigned = True
+            continue
         b = db.get(Batch, batch.id)  # re-read under the lock
         if b.state != BATCH_ACTIVE:
             continue
@@ -264,12 +293,13 @@ def _claim_new(db: Session, device: Device) -> CheckInResult:
             db.commit()
         except IntegrityError:
             db.rollback()
-            return CheckInResult(device, None, REASON_QUOTA_FULL)
+            return CheckInResult(device, None, REASON_QUOTA_FULL, trust=trust)
         db.refresh(asg)
-        return CheckInResult(device, _make_offer(db, device, asg, image))
+        return CheckInResult(device, _make_offer(db, device, asg, image), trust=trust)
 
     db.commit()
-    return CheckInResult(device, None, REASON_QUOTA_FULL)
+    reason = REASON_NO_SIGNED_RELEASE if saw_unsigned else REASON_QUOTA_FULL
+    return CheckInResult(device, None, reason, trust=trust)
 
 
 # ----------------------------------------------------------------------------- #
@@ -302,7 +332,7 @@ def record_event(
     db: Session,
     *,
     device_id: str,
-    assignment_id: str,
+    assignment_id: str | None,
     event_type: str,
     idempotency_key: str,
     payload: dict | None = None,
@@ -312,6 +342,10 @@ def record_event(
     A repeated (device_id, idempotency_key) returns the original outcome with
     duplicate=True and performs zero side effects — no state bump, no quota
     churn, no failure-rate recount.
+
+    Telemetry receipts (e.g. `release_rejected`) may arrive without an
+    assignment: a device that fails trust validation before/without an offer
+    must still be able to leave its durable, idempotent failure receipt.
     """
     if event_type not in KNOWN_EVENTS:
         raise ValueError(f"unknown_event:{event_type}")
@@ -333,36 +367,42 @@ def record_event(
                 "halted_batch_ids": [],
             }
 
-        asg = db.get(Assignment, assignment_id)
-        if asg is None or asg.device_id != device_id:
-            raise LookupError("assignment_not_found")
+        asg = None
+        if assignment_id is not None:
+            asg = db.get(Assignment, assignment_id)
+            if asg is None or asg.device_id != device_id:
+                raise LookupError("assignment_not_found")
+        elif event_type not in TELEMETRY_EVENTS:
+            raise ValueError("assignment_required")
 
-        old_state = asg.install_state
+        old_state = asg.install_state if asg is not None else None
         new_state = EVENT_TO_STATE.get(event_type)
-        if new_state is not None and new_state not in ALLOWED_TRANSITIONS.get(old_state, frozenset()):
+        if (
+            asg is not None
+            and new_state is not None
+            and new_state not in ALLOWED_TRANSITIONS.get(old_state, frozenset())
+        ):
             raise StateError(old_state, new_state)
 
         # Pause/halt gate: a device that has not entered the flash critical
         # region must not advance; an installing device is allowed to report
         # installed/failed so it can finish or roll back safely.
-        batch = db.get(Batch, asg.batch_id)
-        if (
-            new_state is not None
-            and old_state not in CRITICAL_STATES
-            and batch.state in (BATCH_PAUSED, BATCH_HALTED)
-        ):
-            raise GateError(batch.state)
-
-        if new_state is not None:
+        if asg is not None and new_state is not None:
+            batch = db.get(Batch, asg.batch_id)
+            if (
+                old_state not in CRITICAL_STATES
+                and batch.state in (BATCH_PAUSED, BATCH_HALTED)
+            ):
+                raise GateError(batch.state)
             asg.install_state = new_state
             asg.updated_at = utcnow()
 
         device = db.get(Device, device_id)
-        if event_type == STATE_FAILED:
+        if asg is not None and event_type == STATE_FAILED:
             asg.fail_reason = str((payload or {}).get("reason", ""))[:4000]
             if device is not None and (payload or {}).get("rolled_back_to"):
                 device.current_version = str(payload["rolled_back_to"])
-        elif event_type == STATE_INSTALLED:
+        elif asg is not None and event_type == STATE_INSTALLED:
             if device is not None and (payload or {}).get("version"):
                 device.current_version = str(payload["version"])
         elif event_type == "rollback_complete":
@@ -371,7 +411,7 @@ def record_event(
 
         evt = DeviceEvent(
             device_id=device_id,
-            assignment_id=asg.id,
+            assignment_id=asg.id if asg is not None else None,
             event_type=event_type,
             idempotency_key=idempotency_key,
             from_state=old_state,
@@ -381,15 +421,14 @@ def record_event(
         )
         db.add(evt)
 
-        # batch.state may have been changed by another request/session; refresh
-        # just that row so the halt decision cannot run on a stale identity-map
-        # copy while this device was downloading.
-        current_batch = db.get(Batch, asg.batch_id)
-        db.refresh(current_batch)
-        halted = _maybe_halt(db, current_batch) if new_state in (
-            STATE_INSTALLED,
-            STATE_FAILED,
-        ) else []
+        halted: list[str] = []
+        if asg is not None and new_state in (STATE_INSTALLED, STATE_FAILED):
+            # batch.state may have been changed by another request/session;
+            # refresh just that row so the halt decision cannot run on a stale
+            # identity-map copy while this device was downloading.
+            current_batch = db.get(Batch, asg.batch_id)
+            db.refresh(current_batch)
+            halted = _maybe_halt(db, current_batch)
 
         db.commit()
         return {

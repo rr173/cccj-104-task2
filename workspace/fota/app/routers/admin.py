@@ -1,13 +1,14 @@
 """Operator-facing API: images, campaigns, staged batches, fleet/debug views."""
 from __future__ import annotations
 
+import json
 import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .. import config, rollout, storage
+from .. import config, publishing, rollout, storage
 from ..db import get_session
 from ..models import (
     Assignment,
@@ -16,6 +17,8 @@ from ..models import (
     Device,
     DeviceEvent,
     Image,
+    Release,
+    RootMetadata,
     utcnow,
 )
 from ..schemas import (
@@ -27,6 +30,8 @@ from ..schemas import (
     DeviceOut,
     ImageOut,
     RegisterIn,
+    ReleasePublishIn,
+    RootPublishIn,
 )
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -87,6 +92,84 @@ async def upload_image(
 @router.get("/images", response_model=list[ImageOut])
 def list_images(db: Session = Depends(get_session)):
     return db.scalars(select(Image).order_by(Image.created_at.desc())).all()
+
+
+# ----- offline signing: trust root chain -----
+@router.post("/roots")
+def publish_root(body: RootPublishIn, db: Session = Depends(get_session)):
+    """Publish one root-chain link. v1 bootstraps (self-signed); vN+1 must be
+    authorized by both the old and the new root keys. Idempotent by key."""
+    try:
+        return publishing.publish_root(
+            db,
+            metadata=body.metadata,
+            signatures=body.signatures,
+            idempotency_key=body.idempotency_key,
+        )
+    except publishing.NotFound as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    except publishing.Conflict as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
+    except publishing.Validation as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+
+
+@router.get("/roots")
+def list_roots(db: Session = Depends(get_session)):
+    rows = db.scalars(select(RootMetadata).order_by(RootMetadata.version.asc())).all()
+    return [
+        {
+            "version": r.version,
+            "metadata": json.loads(r.metadata_json),
+            "signatures": json.loads(r.signatures_json),
+            "content_hash": r.content_hash,
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
+
+
+# ----- offline signing: releases -----
+@router.post("/releases")
+def publish_release(body: ReleasePublishIn, db: Session = Depends(get_session)):
+    """Publish a signed release for an already-uploaded image. The service
+    verifies the trust chain, signature, expiry, digest binding and counter
+    monotonicity before anything is stored; idempotent by key."""
+    try:
+        return publishing.publish_release(
+            db,
+            image_id=body.image_id,
+            metadata=body.metadata,
+            signatures=body.signatures,
+            idempotency_key=body.idempotency_key,
+        )
+    except publishing.NotFound as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    except publishing.Conflict as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
+    except publishing.Validation as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+
+
+@router.get("/releases")
+def list_releases(model: str | None = None, db: Session = Depends(get_session)):
+    q = select(Release).order_by(Release.created_at.desc())
+    if model:
+        q = q.where(Release.model == model)
+    return [
+        {
+            "id": r.id,
+            "image_id": r.image_id,
+            "model": r.model,
+            "version": r.version,
+            "artifact_sha256": r.artifact_sha256,
+            "security_counter": r.security_counter,
+            "expires_at": r.expires_at,
+            "content_hash": r.content_hash,
+            "created_at": r.created_at,
+        }
+        for r in db.scalars(q).all()
+    ]
 
 
 # ----- campaigns -----
@@ -237,6 +320,7 @@ def list_assignments(batch_id: str | None = None, db: Session = Depends(get_sess
 @router.get("/events")
 def all_events(
     batch_id: str | None = None,
+    event_type: str | None = None,
     limit: int = 100,
     db: Session = Depends(get_session),
 ):
@@ -244,6 +328,8 @@ def all_events(
     if batch_id:
         ids = select(Assignment.id).where(Assignment.batch_id == batch_id)
         q = q.where(DeviceEvent.assignment_id.in_(ids))
+    if event_type:
+        q = q.where(DeviceEvent.event_type == event_type)
     return [
         {
             "id": e.id,
@@ -253,6 +339,7 @@ def all_events(
             "from_state": e.from_state,
             "to_state": e.to_state,
             "duplicate": e.duplicate,
+            "payload": json.loads(e.payload or "{}"),
             "created_at": e.created_at,
         }
         for e in db.scalars(q).all()

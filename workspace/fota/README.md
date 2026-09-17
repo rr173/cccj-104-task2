@@ -5,6 +5,12 @@
 **分块校验续传**；安装失败 A/B 回滚到上一可启动版本并上报原因；批次可暂停/熔断，
 且**失败率越阈自动停止扩散**；所有领取与回执幂等，重复上线、重复回执不重复占名额。
 
+发布链路默认**离线签名**：每个发布都有确定性序列化的签名元数据（制品摘要、型号、
+显示版本、单调递增安全计数器、过期时间），终端在进入关键刷写区之前完成
+**信任链 / 签名 / 过期 / 摘要 / 计数器**五项校验；根密钥轮换需要新旧根双重授权，
+长期离线的设备一次唤醒即可连续 traverse 多代轮换；所有拒绝都会留下
+**持久、可查询、重试幂等**的失败回执，且绝不触碰当前可启动槽。
+
 ## 快速开始（可复现入口）
 
 ```bash
@@ -21,7 +27,7 @@ docker run --rm fota-service:dev test -v
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --port 8080
-python -m pytest -q               # 26 项测试
+python -m pytest -q               # 41 项测试
 ```
 
 - `Dockerfile` 的 `ENTRYPOINT` 是 `entrypoint.sh`：无参数起 API；`test` 跑 pytest；
@@ -36,6 +42,14 @@ curl -F file=@firmware.bin -F model=term-x1 -F version=2.0.0 \
      -F min_bootloader=1.0.0 -F max_bootloader=1.99.0 \
      http://localhost:8080/api/admin/images
 
+# 1b. 离线签名（私钥不接触服务）：先建信任根 v1（自签名），再发布签名发布。
+#     元数据为规范化 JSON（键排序、紧凑分隔符），签名走 ed25519；
+#     测试里的 tests/conftest.py::TrustKit 与 app/trust.py 演示了完整签名流程。
+curl -X POST localhost:8080/api/admin/roots \
+     -d '{"metadata":<root元数据>,"signatures":[...],"idempotency_key":"..."}' ...
+curl -X POST localhost:8080/api/admin/releases \
+     -d '{"image_id":"<img>","metadata":<release元数据>,"signatures":[...],"idempotency_key":"..."}' ...
+
 # 2. 基于镜像建发布活动，再建按硬件批次的灰度阶段（quota 支持绝对名额/百分比）
 curl -X POST localhost:8080/api/admin/campaigns -d '{"name":"q3","image_id":"<img>"}' ...
 curl -X POST localhost:8080/api/admin/batches -d '{"campaign_id":"<c>","hardware_batch":"HW2026Q3","stage":1,"quota_mode":"absolute","quota_value":2,"failure_threshold":0.2,"failure_min_sample":5}' ...
@@ -45,8 +59,9 @@ curl -X POST localhost:8080/api/admin/batches/<id>/action -d '{"action":"activat
 
 # 3. 终端侧（每次联网唤醒执行）
 curl -X POST localhost:8080/api/device/register -d '{"id":"term-1","model":"term-x1",...}'
-curl -X POST localhost:8080/api/device/check-in -H 'X-Device-Id: term-1'
-#   offered=true 时返回分块清单（每块 offset/size/sha256）
+curl -X POST localhost:8080/api/device/check-in -H 'X-Device-Id: term-1' -H 'X-Root-Version: 1'
+#   offered=true 时返回分块清单（每块 offset/size/sha256）+ 签名发布信封；
+#   trust.root_chain 携带设备缺失的根链链接（离线期间的轮换一次补齐）
 curl 'localhost:8080/api/device/artifacts/<img>/chunks/0?assignment_id=<a>' -H 'X-Device-Id: term-1'
 curl -X POST localhost:8080/api/device/events -H 'X-Device-Id: term-1' \
      -d '{"assignment_id":"<a>","event_type":"installed","idempotency_key":"<每设备每里程碑唯一>","payload":{...}}'
@@ -128,6 +143,38 @@ curl -X POST localhost:8080/api/device/events -H 'X-Device-Id: term-1' \
   同步权威状态再带新 key 处理，绝不“以为升级了/没升级”。
 - `download_started`、`rollback_complete` 是纯遥测事件，不推动状态机，可安全重复。
 
+### 9. 离线发布签名（进入关键区前的五项校验）
+- 每个发布都有**确定性序列化**的签名元数据（规范化 JSON：键排序、紧凑分隔符），
+  覆盖 `artifact_sha256 / model / version(显示版本) / security_counter / expires`；
+  签名算法 ed25519，私钥永不接触服务（`app/trust.py` 同时被服务端与终端复用，
+   canonicalization 不可能漂移）。
+- 终端在 `installing`（关键刷写区）**之前**依次校验：信任链 → 签名 → 过期 →
+  制品摘要 → 安全计数器。任何一步失败：不写槽、保留当前可启动槽，并上报
+  `release_rejected` 回执（持久化在 `device_events`，设备端与运营端均可查询；
+  回执 key 由拒绝内容派生，断网重试天然幂等去重）。
+- 无有效签名发布的镜像**永不 offer**（check-in 返回 `no_signed_release`，失败闭合）。
+
+### 10. 防回滚安全计数器
+- 终端持久化"已接受的最高计数器"（`trust.json`，原子写），只接受
+  `counter >= 已接受最高值` 的发布；接受后立即落盘，**进程重启不回退**。
+- 服务端同样单调：同一型号的发布计数器只升不降（`counter_regression` 409），
+  信任状态不可能被发布动作拉低。
+
+### 11. 根密钥轮换（新旧根双重授权）
+- 根元数据按版本链式推进：v1 自签名（设备首用信任，生产应在出厂时预置）；
+  vN+1 必须同时携带 **vN 根密钥的授权签名** 和 **vN+1 根密钥的自承诺签名**。
+- 长期离线的设备唤醒时，check-in 按 `X-Root-Version` 返回缺失的整段根链，
+  设备逐节校验后**原子切换**（tmp + rename）；任何一环缺失/未授权/过期都失败闭合，
+  中断后重试从旧状态重新收敛，绝不出现"半个信任状态"。
+- 被吊销的签名密钥（根元数据里 `revoked:true` 或不再列出）签署的发布，
+  设备端与服务端发布入口都会拒绝；切流后只被旧根签署的内容同样被拒绝。
+
+### 12. 发布幂等（并发发布只有一个结果）
+- `POST /roots`、`POST /releases` 都带 `idempotency_key`（唯一索引兜底）：
+  同 key 同内容重放返回首次结果（`duplicate:true`）；同 key 不同内容 409。
+- 同一 `(model, version)` 的发布内容唯一：不同内容冒名同一版本 → 409
+  （`release_version_conflict` / `release_exists`）；根版本重写/跳号同样被拒绝。
+
 ## 数据模型（`app/models.py`）
 
 ```
@@ -141,11 +188,16 @@ assignments(id, device_id, campaign_id, batch_id,
             install_state, fail_reason, active_slot)   -- UNIQUE(device,campaign)
 device_events(id, device_id, assignment_id, event_type, idempotency_key,
               from_state, to_state, payload)           -- UNIQUE(device,idempotency_key)
+root_metadata(version, metadata_json, signatures_json,
+              content_hash, idempotency_key)           -- 版本即主键，链式单调
+releases(id, image_id, model, version, artifact_sha256, security_counter,
+         expires_at, metadata_json, signatures_json, content_hash,
+         idempotency_key)                              -- UNIQUE(model,version), UNIQUE(image)
 ```
 
 ## 验证矩阵
 
-`docker run --rm fota-service:dev test -v` 或本地 `pytest -v`（26 项）：
+`docker run --rm fota-service:dev test -v` 或本地 `pytest -v`（41 项）：
 
 | 关注点 | 测试文件 |
 |---|---|
@@ -155,10 +207,13 @@ device_events(id, device_id, assignment_id, event_type, idempotency_key,
 | 暂停拦截、关键区收尾、级联、force 恢复 | `tests/test_pause_halt.py` |
 | 越阈熔断、级联停扩散、阈值边界、原因留档 | `tests/test_failure_halt.py` |
 | 回执重放、8 路并发重复上线、名额竞争、乱序拒绝 | `tests/test_idempotency.py` |
+| 签名发布安装、篡改元数据/块拒绝、过期/吊销/计数器回滚、多代轮换、缺环失败闭合、轮换中断收敛、并发发布幂等、退休根拒绝、暂停门保持 | `tests/test_signing.py` |
 
 真实 HTTP 进程端到端（非 TestClient）也已验证：断 1 块后唤醒只拉剩余块、
 暂停中途唤醒返回 `batch_paused`、恢复后续传并安装、2/2 失败自动熔断并级联阶段 3、
-失败设备影子版本回滚、安装成功版本跨进程重启保持。
+失败设备影子版本回滚、安装成功版本跨进程重启保持；
+签名链路同样过了真实进程验证：种子根链 + 签名发布安装、篡改拒绝回执、
+服务端重启后根链/发布/回执/设备信任状态全部保持、离线轮换 v1→v2 一次唤醒收敛。
 
 ## 配置（环境变量）
 
@@ -169,12 +224,13 @@ device_events(id, device_id, assignment_id, event_type, idempotency_key,
 | `CHUNK_SIZE` | 262144 | 块大小（字节） |
 | `FAILURE_THRESHOLD` / `FAILURE_MIN_SAMPLE` | 0.2 / 3 | 批次默认熔断阈值与最小样本 |
 | `SEED_DEMO` | false | 启动时种入一个演示镜像 + 金丝雀批次（compose 开启） |
+| `DEMO_KEYS_PATH` | `<STORAGE_ROOT>/../demo_keys.json` | 演示用签名密钥对的落盘位置（仅 demo；生产私钥应离线保管） |
 
 ## 生产化备注（本实现刻意留出的边界）
 
 - 鉴权：管理端应加运营 SSO/角色，设备端用设备证书/签名令牌（当前为裸 header，便于演示）。
-- 镜像安全：已做传输与落盘完整性（sha256），上线前应加**发布签名验签**（如 ed25519/minisign），
-  终端刷写前校验签名而不仅是哈希。
+- 信任根引导：设备首用信任（TOFU）自签名的 root v1；生产应在出厂时预置 root v1 公钥，
+  并用 HSM/KMS 保管根私钥，发布签名保持离线。
 - 规模：单 worker + 进程锁 + sqlite 用于可复现演示；多实例部署切 Postgres，
   将名额领取改为批次行 `SELECT … FOR UPDATE`，块对象放 S3/CDN（块内容寻址且 immutable，可直接缓存）。
 - 回执可加老化归档；`assignments` 建议按 (campaign, device) 分区。

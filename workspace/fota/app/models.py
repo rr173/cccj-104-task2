@@ -172,3 +172,43 @@ class DeviceEvent(Base):
     __table_args__ = (
         UniqueConstraint("device_id", "idempotency_key", name="uq_event_device_idem"),
     )
+
+
+# --- offline release signing: versioned trust root + signed releases ---------
+class RootMetadata(Base):
+    """One link of the trust-root chain. Versions are consecutive integers;
+    vN+1 is only stored after proving authorization by both the vN and the
+    vN+1 root keys. The chain is the service's authoritative trust state and can
+    never move backwards (rewrites/gaps are rejected at publish time)."""
+    __tablename__ = "root_metadata"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False)      # canonical JSON
+    signatures_json: Mapped[str] = mapped_column(Text, nullable=False)  # canonical JSON
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Release(Base):
+    """A signed release bound 1:1 to an image. The canonical metadata +
+    signatures are stored verbatim so devices re-verify offline; the columns
+    mirror the signed fields for server-side gating and monotonicity checks."""
+    __tablename__ = "releases"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    image_id: Mapped[str] = mapped_column(ForeignKey("images.id"), nullable=False, unique=True)
+    model: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    security_counter: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[str] = mapped_column(String(40), nullable=False)  # ISO-8601 UTC
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False)     # canonical JSON
+    signatures_json: Mapped[str] = mapped_column(Text, nullable=False)   # canonical JSON
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("model", "version", name="uq_release_model_version"),
+    )

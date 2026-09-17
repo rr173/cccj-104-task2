@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from sqlalchemy import select
@@ -10,7 +11,7 @@ from sqlalchemy.orm import Session
 from .. import rollout, storage
 from ..db import get_session
 from ..models import Device, DeviceEvent, utcnow
-from ..schemas import CheckInResponse, EventIn, EventOut, OfferOut, RegisterIn
+from ..schemas import CheckInResponse, EventIn, EventOut, OfferOut, RegisterIn, TrustBundle
 
 router = APIRouter(prefix="/api/device", tags=["device"])
 
@@ -48,19 +49,24 @@ def register(body: RegisterIn, db: Session = Depends(get_session)) -> RegisterIn
 def check_in(
     db: Session = Depends(get_session),
     x_device_id: str | None = Header(default=None),
+    x_root_version: int | None = Header(default=None),
 ) -> CheckInResponse:
     device = _device_or_404(db, _device_id_header(x_device_id))
-    result = rollout.check_in(db, device)
+    # The device reports the root version it currently trusts; the service
+    # returns every chain link above it so the device catches up atomically.
+    result = rollout.check_in(db, device, device_root_version=x_root_version or 0)
     return CheckInResult_to_response(device, result)
 
 
 def CheckInResult_to_response(device, result) -> CheckInResponse:  # noqa: N802
     offer = OfferOut(**result.offer.__dict__) if result.offer else None
+    trust = TrustBundle(**result.trust) if result.trust else None
     return CheckInResponse(
         device_id=device.id,
         offered=result.offer is not None,
         reason=result.reason,
         offer=offer,
+        trust=trust,
         server_time=utcnow(),
     )
 
@@ -148,6 +154,7 @@ def list_events(
             "from_state": e.from_state,
             "to_state": e.to_state,
             "duplicate": e.duplicate,
+            "payload": json.loads(e.payload or "{}"),
             "created_at": e.created_at,
         }
         for e in rows
