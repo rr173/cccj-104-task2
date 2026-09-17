@@ -15,6 +15,7 @@ import json
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -85,6 +86,21 @@ class GateError(Exception):
         self.batch_state = batch_state
 
 
+class TrustGateError(Exception):
+    """Release failed the pre-critical-write trust evaluation.
+
+    The active slot is never touched; the durable reason code is persisted as
+    a failure receipt and surfaced to the device. This mirrors exactly what a
+    correct terminal concludes locally — the server gate is defense in depth
+    so a tampered/legacy client cannot talk its way into the critical phase.
+    """
+
+    def __init__(self, reason: str, receipt_id: str | None = None):
+        super().__init__(f"trust_rejected:{reason}")
+        self.reason = reason
+        self.receipt_id = receipt_id
+
+
 @dataclass
 class Offer:
     assignment_id: str
@@ -100,6 +116,11 @@ class Offer:
     # client must finish the pending install and then report. Never abort.
     finalize_only: bool = False
     install_state: str = STATE_ASSIGNED
+    # Signed release envelope + the claims the terminal verifies pre-flash.
+    signed_release: dict | None = None
+    security_counter: int = 0
+    expires_at: datetime | None = None
+    root_version: int = 1
 
 
 @dataclass
@@ -107,6 +128,8 @@ class CheckInResult:
     device: Device
     offer: Offer | None = None
     reason: str | None = None
+    root_version: int | None = None
+    root_updates: list[dict] = field(default_factory=list)
 
 
 # ----------------------------------------------------------------------------- #
@@ -144,6 +167,12 @@ def _manifest_chunks(image: Image) -> list[dict]:
 
 
 def _make_offer(db: Session, device: Device, assignment: Assignment, image: Image) -> Offer:
+    from . import trust
+
+    signed = trust.release_for(db, image.id)
+    envelope = json.loads(signed.envelope) if signed is not None else None
+    root_row = trust.latest_committed_root(db, image.model)
+    root_version = root_row.version if root_row is not None else 1
     return Offer(
         assignment_id=assignment.id,
         campaign_id=assignment.campaign_id,
@@ -156,6 +185,10 @@ def _make_offer(db: Session, device: Device, assignment: Assignment, image: Imag
         chunks=_manifest_chunks(image),
         finalize_only=assignment.install_state in PAST_DOWNLOAD_STATES,
         install_state=assignment.install_state,
+        signed_release=envelope,
+        security_counter=signed.counter if signed else 0,
+        expires_at=signed.expires if signed else None,
+        root_version=root_version,
     )
 
 
@@ -198,13 +231,32 @@ def _candidate_batches(db: Session, device: Device) -> list[tuple[Batch, Campaig
 # ----------------------------------------------------------------------------- #
 # Check-in
 # ----------------------------------------------------------------------------- #
-def check_in(db: Session, device: Device) -> CheckInResult:
+def check_in(db: Session, device: Device, *, reported_root_version: int | None = None) -> CheckInResult:
     # Serialize the whole read-modify-write: prevents two concurrent check-ins
     # of the same device from racing, and keeps per-process seat claims atomic.
     # The UNIQUE(device,campaign) constraint remains the durable backstop.
     with _claim_lock:
+        from . import trust
+
         device.last_seen = utcnow()
         db.add(device)
+
+        # Root catch-up material for a device returning after an outage: every
+        # committed envelope strictly above its applied version, ascending.
+        # The device reports its applied version (it may be ahead of what this
+        # server has durably recorded if it applied anchors offline).
+        dts = trust.get_device_trust(db, device.id, device.model)
+        applied = max(dts.root_version, reported_root_version or 0)
+        if applied > dts.root_version:
+            dts.root_version = applied
+            db.add(dts)
+        root_row = trust.latest_committed_root(db, device.model)
+        result_kwargs: dict = {}
+        if root_row is not None:
+            result_kwargs["root_version"] = root_row.version
+            result_kwargs["root_updates"] = trust.root_envelopes(
+                db, device.model, after_version=applied
+            )
 
         # Existing ledger rows for this device get first say (pause/finish safety).
         existing = db.scalars(
@@ -222,21 +274,24 @@ def check_in(db: Session, device: Device) -> CheckInResult:
             if asg.install_state in CRITICAL_STATES:
                 # Flash writes in progress: always allow finishing + reporting.
                 db.commit()
-                return CheckInResult(device, _make_offer(db, device, asg, image))
+                return CheckInResult(device, _make_offer(db, device, asg, image), **result_kwargs)
             if batch.state == BATCH_PAUSED:
                 db.commit()
-                return CheckInResult(device, None, REASON_BATCH_PAUSED)
+                return CheckInResult(device, None, REASON_BATCH_PAUSED, **result_kwargs)
             if batch.state == BATCH_HALTED:
                 db.commit()
-                return CheckInResult(device, None, REASON_BATCH_HALTED)
+                return CheckInResult(device, None, REASON_BATCH_HALTED, **result_kwargs)
             if batch.state == BATCH_ACTIVE:
                 # assigned/downloading/downloaded: serve manifest so the client
                 # resumes verified blocks or proceeds to install.
                 db.commit()
-                return CheckInResult(device, _make_offer(db, device, asg, image))
+                return CheckInResult(device, _make_offer(db, device, asg, image), **result_kwargs)
 
         # No live assignment: claim a seat in an active batch.
-        return _claim_new(db, device)
+        claimed = _claim_new(db, device)
+        claimed.root_version = result_kwargs.get("root_version")
+        claimed.root_updates = result_kwargs.get("root_updates", [])
+        return claimed
 
 
 def _claim_new(db: Session, device: Device) -> CheckInResult:
@@ -270,6 +325,107 @@ def _claim_new(db: Session, device: Device) -> CheckInResult:
 
     db.commit()
     return CheckInResult(device, None, REASON_QUOTA_FULL)
+
+
+# ----------------------------------------------------------------------------- #
+# Critical-phase trust gate
+# ----------------------------------------------------------------------------- #
+def _assignment_signature(db: Session, asg: Assignment):
+    from . import trust
+
+    campaign = db.get(Campaign, asg.campaign_id)
+    image = db.get(Image, campaign.image_id)
+    return trust.release_for(db, image.id) if image is not None else None
+
+
+def _rejection_key(prefix: str, device_id: str, image_sha: str, counter) -> str:
+    import hashlib
+
+    raw = f"{prefix}|{device_id}|{image_sha}|{counter}".encode()
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+def _enforce_critical_trust_gate(
+    db: Session, device_id: str, asg: Assignment, payload: dict | None
+) -> None:
+    """Authoritative re-verification before flash writes may start.
+
+    Mirrors the terminal's own checks: signed metadata over the exact artifact
+    digest, model binding, valid (unexpired) signatures under the current root
+    chain, and a strictly-advancing security counter vs durable state.
+    """
+    import hashlib
+
+    from . import storage, trust
+    from .security import TrustError
+
+    campaign = db.get(Campaign, asg.campaign_id)
+    image = db.get(Image, campaign.image_id)
+    sig = trust.release_for(db, image.id)
+
+    def reject(reason: str, detail: str | None = None):
+        idem = _rejection_key("gate", device_id, image.sha256, sig.counter if sig else None)
+        receipt, _created = trust.record_rejection(
+            db,
+            device_id=device_id,
+            assignment_id=asg.id,
+            model=image.model,
+            image_id=image.id,
+            image_sha256=image.sha256,
+            version=image.version,
+            counter_seen=sig.counter if sig else None,
+            root_version_seen=trust.latest_committed_root(db, image.model).version
+            if trust.latest_committed_root(db, image.model) else None,
+            reason=reason,
+            stage="pre_flash",
+            detail=detail,
+            idempotency_key=idem,
+        )
+        db.commit()
+        raise TrustGateError(reason, receipt.id)
+
+    if sig is None:
+        reject("unsigned_release")
+
+    envelope = json.loads(sig.envelope)
+    try:
+        claims, _root, state = trust.evaluate_release_for_device(
+            db,
+            device_id=device_id,
+            model=image.model,
+            envelope=envelope,
+        )
+    except TrustError as e:
+        db.rollback()
+        # record_rejection needs its own clean transaction.
+        receipt, _c = trust.record_rejection(
+            db,
+            device_id=device_id,
+            assignment_id=asg.id,
+            model=image.model,
+            image_id=image.id,
+            image_sha256=image.sha256,
+            version=image.version,
+            counter_seen=sig.counter,
+            reason=e.reason,
+            stage="pre_flash",
+            detail=str(e),
+            idempotency_key=_rejection_key("gate", device_id, image.sha256, sig.counter),
+        )
+        db.commit()
+        raise TrustGateError(e.reason, receipt.id) from None
+
+    # Bind the signed digest to the served artifact and the reported size.
+    if claims.artifact_digest != "sha256:" + image.sha256:
+        reject("artifact_digest_mismatch")
+    manifest = storage.load_manifest(image.sha256)
+    if manifest is None or manifest.sha256 != image.sha256:
+        reject("artifact_unavailable")
+    # If the device reported a locally-computed whole-artifact hash it must
+    # equal the signed digest (tampered-block defense at the gate too).
+    reported = (payload or {}).get("artifact_sha256")
+    if reported is not None and reported != image.sha256:
+        reject("artifact_digest_mismatch", f"reported:{reported}")
 
 
 # ----------------------------------------------------------------------------- #
@@ -353,6 +509,15 @@ def record_event(
         ):
             raise GateError(batch.state)
 
+        # Trust gate at the critical-phase boundary. Entering "installing" is
+        # the first irreversible-ish action (flash writes begin), so the full
+        # chain — signatures, expiry, artifact binding, anti-rollback counter —
+        # is re-evaluated here against durable server state, exactly as the
+        # terminal did after downloading. Any failure: reject, keep the old
+        # slot bootable, persist a durable idempotent failure receipt.
+        if new_state == STATE_INSTALLING and old_state == STATE_DOWNLOADED:
+            _enforce_critical_trust_gate(db, device_id, asg, payload)
+
         if new_state is not None:
             asg.install_state = new_state
             asg.updated_at = utcnow()
@@ -365,6 +530,20 @@ def record_event(
         elif event_type == STATE_INSTALLED:
             if device is not None and (payload or {}).get("version"):
                 device.current_version = str(payload["version"])
+            # Commit the anti-rollback watermark only once a successful install
+            # is confirmed; it then survives restarts and rejects every counter
+            # at or below it.
+            sig = _assignment_signature(db, asg)
+            if sig is not None:
+                from . import trust
+
+                trust.bump_device_trust(
+                    db,
+                    device_id=device_id,
+                    model=sig.model,
+                    root_version=trust.latest_committed_root(db, sig.model).version,
+                    counter=sig.counter,
+                )
         elif event_type == "rollback_complete":
             if device is not None and (payload or {}).get("rolled_back_to"):
                 device.current_version = str(payload["rolled_back_to"])

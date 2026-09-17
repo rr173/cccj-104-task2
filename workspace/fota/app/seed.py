@@ -26,6 +26,8 @@ def _demo_firmware() -> bytes:
 def seed_if_empty(db: Session) -> None:
     if db.scalar(select(Image).where(Image.model == DEMO_MODEL)):
         return
+    from . import trust
+
     stored = storage.save_blob(_demo_firmware())
     img = Image(
         id=str(uuid.uuid4()),
@@ -40,6 +42,9 @@ def seed_if_empty(db: Session) -> None:
     )
     db.add(img)
     db.flush()
+    # Trust anchor + deterministically signed release metadata for the demo.
+    trust.ensure_genesis(db, DEMO_MODEL)
+    trust.sign_release(db, img)
     camp = Campaign(id=str(uuid.uuid4()), name=f"demo-{DEMO_MODEL}-{DEMO_VERSION}", image_id=img.id)
     db.add(camp)
     db.flush()

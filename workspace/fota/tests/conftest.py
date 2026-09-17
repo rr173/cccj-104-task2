@@ -14,6 +14,7 @@ import pytest
 _TMP = Path(tempfile.mkdtemp(prefix="fota-test-"))
 os.environ["DATABASE_URL"] = f"sqlite:///{_TMP / 'test.db'}"
 os.environ["STORAGE_ROOT"] = str(_TMP / "artifacts")
+os.environ["KEYS_ROOT"] = str(_TMP / "keys")
 os.environ["CHUNK_SIZE"] = "64"          # tiny blocks -> many chunks in tests
 os.environ["FAILURE_THRESHOLD"] = "0.5"
 os.environ["FAILURE_MIN_SAMPLE"] = "2"
@@ -25,17 +26,25 @@ import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from client import SimDevice  # noqa: E402
+from client.trust import TerminalTrust  # noqa: E402
 
 
 @pytest.fixture()
 def client():
     # Drop/recreate schema for full isolation per test.
+    import shutil
+
     from app import db as dbmod
     from app.db import Base, engine
 
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     dbmod.config.STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    # The offline keyring is durable by design; wipe it so models/anchors do
+    # not leak between tests.
+    if dbmod.config.KEYS_ROOT.exists():
+        shutil.rmtree(dbmod.config.KEYS_ROOT)
+    dbmod.config.KEYS_ROOT.mkdir(parents=True, exist_ok=True)
     from app.main import app
 
     with TestClient(app) as c:
@@ -62,6 +71,7 @@ class AdminHelper:
         max_bootloader="1.99.0",
         blob_seed=b"FW-2.0",
         size=200,
+        sign=True,
     ):
         blob = _blob(blob_seed, size)
         r = self.c.post(
@@ -71,6 +81,7 @@ class AdminHelper:
                 "version": version,
                 "min_bootloader": min_bootloader,
                 "max_bootloader": max_bootloader,
+                "sign": "true" if sign else "false",
             },
             files={"file": ("fw.bin", io.BytesIO(blob), "application/octet-stream")},
         )
@@ -141,6 +152,23 @@ class AdminHelper:
         assert r.status_code == 200, r.text
         return r.json()
 
+    # ----- trust -----
+    def rotate(self, model, idem, **kw):
+        body = {"model": model, "idempotency_key": idem, **kw}
+        return self.c.post("/api/admin/trust/rotate", json=body)
+
+    def trust_status(self, model):
+        return self.c.get(f"/api/admin/trust/{model}/status")
+
+    def roots(self, model):
+        return self.c.get(f"/api/admin/trust/{model}/roots")
+
+    def publish_envelope(self, image_id, envelope, idem=None):
+        body = {"image_id": image_id, "envelope": envelope}
+        if idem:
+            body["idempotency_key"] = idem
+        return self.c.post("/api/admin/releases/publish", json=body)
+
 
 @pytest.fixture()
 def admin(client):
@@ -171,6 +199,8 @@ def make_device(client, tmp_path):
         d._offer = None
         d._idem = d._load_idem()
         d._load_persisted_state()
+        d.trust = TerminalTrust(d.workdir / "trust.json", d.facts["model"])
+        d.last_rejection = None
         return d
 
     return _make

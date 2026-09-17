@@ -7,10 +7,18 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import rollout, storage
+from .. import rollout, storage, trust
 from ..db import get_session
-from ..models import Device, DeviceEvent, utcnow
-from ..schemas import CheckInResponse, EventIn, EventOut, OfferOut, RegisterIn
+from ..models import Device, DeviceEvent, FailureReceipt, utcnow
+from ..schemas import (
+    CheckInResponse,
+    EventIn,
+    EventOut,
+    OfferOut,
+    RejectionIn,
+    RejectionOut,
+    RegisterIn,
+)
 
 router = APIRouter(prefix="/api/device", tags=["device"])
 
@@ -48,9 +56,12 @@ def register(body: RegisterIn, db: Session = Depends(get_session)) -> RegisterIn
 def check_in(
     db: Session = Depends(get_session),
     x_device_id: str | None = Header(default=None),
+    x_device_root_version: int | None = Header(default=None),
 ) -> CheckInResponse:
     device = _device_or_404(db, _device_id_header(x_device_id))
-    result = rollout.check_in(db, device)
+    result = rollout.check_in(
+        db, device, reported_root_version=x_device_root_version
+    )
     return CheckInResult_to_response(device, result)
 
 
@@ -62,7 +73,34 @@ def CheckInResult_to_response(device, result) -> CheckInResponse:  # noqa: N802
         reason=result.reason,
         offer=offer,
         server_time=utcnow(),
+        root_version=result.root_version,
+        root_updates=result.root_updates,
     )
+
+
+@router.get("/trust/{model}")
+def get_trust(
+    model: str,
+    db: Session = Depends(get_session),
+    x_device_id: str | None = Header(default=None),
+    after_version: int = Query(default=0, ge=0),
+):
+    """Consecutive committed root envelopes above ``after_version`` plus the
+    device's recorded watermark. A returning device walks these in order and
+    applies them atomically; a missing intermediate link fails closed."""
+    device_id = _device_id_header(x_device_id)
+    _device_or_404(db, device_id)
+    latest = trust.latest_committed_root(db, model)
+    if latest is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no_trust_anchor")
+    state = trust.get_device_trust(db, device_id, model)
+    return {
+        "model": model,
+        "current_version": latest.version,
+        "device_root_version": state.root_version,
+        "roots": trust.root_envelopes(db, model, after_version=after_version),
+        "server_time": utcnow(),
+    }
 
 
 @router.get("/artifacts/{image_id}/chunks/{index}")
@@ -119,11 +157,101 @@ def post_event(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "assignment_not_found")
     except rollout.GateError as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
+    except rollout.TrustGateError as e:
+        # Content refused before the critical write; active slot unchanged.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {"reason": e.reason, "receipt_id": e.receipt_id},
+        )
     except rollout.StateError as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     return EventOut(**out)
+
+
+@router.post("/rejections", response_model=RejectionOut, status_code=status.HTTP_201_CREATED)
+def post_rejection(
+    body: RejectionIn,
+    db: Session = Depends(get_session),
+    x_device_id: str | None = Header(default=None),
+) -> RejectionOut:
+    """Persist a durable, queryable failure receipt for a release the device
+    rejected before its critical write. Stable idempotency key => one row and
+    one result across retries; never affects quota or the install FSM."""
+    device_id = _device_id_header(x_device_id)
+    _device_or_404(db, device_id)
+    try:
+        row, created = trust.record_rejection(
+            db,
+            device_id=device_id,
+            assignment_id=body.assignment_id,
+            model=body.model,
+            image_id=body.image_id,
+            image_sha256=body.image_sha256,
+            version=body.version,
+            counter_seen=body.counter_seen,
+            root_version_seen=body.root_version_seen,
+            reason=body.reason,
+            stage=body.stage,
+            detail=body.detail,
+            idempotency_key=body.idempotency_key,
+        )
+    except Exception:
+        raise
+    return RejectionOut(
+        id=row.id,
+        device_id=row.device_id,
+        assignment_id=row.assignment_id,
+        model=row.model,
+        image_id=row.image_id,
+        image_sha256=row.image_sha256,
+        version=row.version,
+        counter_seen=row.counter_seen,
+        root_version_seen=row.root_version_seen,
+        reason=row.reason,
+        stage=row.stage,
+        detail=row.detail,
+        resolved=row.resolved,
+        idempotency_key=row.idempotency_key,
+        duplicate=not created,
+        created_at=row.created_at,
+    )
+
+
+@router.get("/rejections")
+def list_rejections(
+    db: Session = Depends(get_session),
+    x_device_id: str | None = Header(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    device_id = _device_id_header(x_device_id)
+    _device_or_404(db, device_id)
+    rows = db.scalars(
+        select(FailureReceipt)
+        .where(FailureReceipt.device_id == device_id)
+        .order_by(FailureReceipt.created_at.desc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "id": r.id,
+            "assignment_id": r.assignment_id,
+            "model": r.model,
+            "image_id": r.image_id,
+            "image_sha256": r.image_sha256,
+            "version": r.version,
+            "counter_seen": r.counter_seen,
+            "root_version_seen": r.root_version_seen,
+            "reason": r.reason,
+            "stage": r.stage,
+            "detail": r.detail,
+            "resolved": r.resolved,
+            "idempotency_key": r.idempotency_key,
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
 
 
 @router.get("/events")

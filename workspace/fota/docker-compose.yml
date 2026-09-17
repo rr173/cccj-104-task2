@@ -7,6 +7,7 @@ services:
     environment:
       DATABASE_URL: sqlite:////data/fota.db
       STORAGE_ROOT: /data/artifacts
+      KEYS_ROOT: /data/keys
       CHUNK_SIZE: "262144"
       SEED_DEMO: "true"
       FAILURE_THRESHOLD: "0.2"

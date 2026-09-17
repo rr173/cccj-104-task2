@@ -17,6 +17,8 @@ from pathlib import Path
 
 import httpx
 
+from .trust import TerminalTrust, TrustRejected
+
 
 class SimDevice:
     def __init__(
@@ -49,6 +51,8 @@ class SimDevice:
         self._offer: dict | None = None
         self._idem = self._load_idem()
         self._load_persisted_state()  # survive process restart / power loss
+        self.trust = TerminalTrust(self.workdir / "trust.json", model)
+        self.last_rejection: dict | None = None
 
     # ----- state persistence across process restarts -----
     @property
@@ -127,7 +131,12 @@ class SimDevice:
 
     # ----- API helpers -----
     def _h(self) -> dict:
-        return {"X-Device-Id": self.device_id}
+        h = {"X-Device-Id": self.device_id}
+        # Report the currently applied root version so the server only sends
+        # genuinely newer links (works even before the DB watermark lands).
+        if getattr(self, "trust", None) is not None:
+            h["X-Device-Root-Version"] = str(self.trust.root_version)
+        return h
 
     def register(self):
         r = self.client.post("/api/device/register", json=self.facts)
@@ -140,6 +149,12 @@ class SimDevice:
         body = r.json()
         if body.get("offer"):
             self._offer = body["offer"]
+        # Catch up on the root trust chain BEFORE trusting any offered
+        # metadata. All-or-nothing: an expired/gapped/revoked link leaves the
+        # device on its previous trusted root.
+        updates = body.get("root_updates") or []
+        if updates:
+            self.trust.apply_root_chain(updates)
         return body
 
     # ----- block download with verified resume -----
@@ -216,14 +231,83 @@ class SimDevice:
         if hashlib.sha256(blob).hexdigest() != manifest["image_sha256"]:
             raise IOError("full image sha256 mismatch")
 
+        # PRE-CRITICAL-WRITE TRUST GATE. The full blob is verified (blocks),
+        # but nothing has been flashed yet: validate the deterministic signed
+        # metadata — trust chain, signatures, expiry, artifact digest, model,
+        # display version and the anti-rollback counter — before declaring the
+        # download usable. Any failure rejects, keeps the active slot and
+        # produces a durable, idempotent failure receipt.
+        self._verify_offer_before_flash(manifest["image_sha256"])
+
         if self._offer["install_state"] != "downloaded":
             self._event("downloaded", {"size": len(blob)})
         return {"aborted": None, "verified_blocks": len(good), "new_blocks": new_fetched}
 
+    # ----- trust verification before the critical write phase -----
+    def _rejection_idem(self, reason: str) -> str:
+        # Stable per (device, release, rejection-kind): a retry after crash is
+        # a replay of the same receipt, not a new row.
+        raw = f"{self.device_id}:{self._offer['image_sha256']}:" \
+              f"{self._counter_seen()}:{reason}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+    def _counter_seen(self):
+        try:
+            return self._offer["signed_release"]["signed"].get("counter")
+        except (KeyError, TypeError, AttributeError):
+            return self._offer.get("security_counter")
+
+    def report_rejection(self, reason: str, *, stage: str = "pre_flash",
+                         detail: str | None = None) -> dict:
+        """Durable failure receipt; idempotent on a stable key."""
+        key = self._rejection_idem(reason)
+        body = {
+            "assignment_id": self._offer["assignment_id"],
+            "reason": reason,
+            "stage": stage,
+            "idempotency_key": key,
+            "image_id": self._offer["image_id"],
+            "image_sha256": self._offer["image_sha256"],
+            "model": self.facts["model"],
+            "version": self._offer["version"],
+            "counter_seen": self._counter_seen(),
+            "root_version_seen": self.trust.root_version,
+        }
+        if detail:
+            body["detail"] = str(detail)[:1900]
+        r = self.client.post("/api/device/rejections", headers=self._h(), json=body)
+        r.raise_for_status()
+        out = r.json()
+        self.last_rejection = out
+        return out
+
+    def _verify_offer_before_flash(self, image_sha256: str):
+        envelope = self._offer.get("signed_release")
+        try:
+            claims = self.trust.verify_release(
+                envelope,
+                artifact_sha256=image_sha256,
+                version=self._offer["version"],
+            )
+        except TrustRejected as e:
+            # Active slot is never touched; make the rejection durable and
+            # queryable. Retrying is idempotent.
+            self.report_rejection(e.reason, detail=str(e))
+            raise
+        return claims
+
     # ----- install / rollback -----
     def install(self) -> dict:
         assert self._offer and self._offer["install_state"] == "downloaded", "download first"
-        self._event("installing", {"slot": self._inactive_slot()})
+
+        # Re-verify at the exact critical boundary (a rotation/expiry could
+        # have landed between download completion and this wake-up).
+        blob = self._blob_path()
+        digest = hashlib.sha256(blob.read_bytes()).hexdigest() if blob.exists() else None
+        claims = self._verify_offer_before_flash(digest or self._offer["image_sha256"])
+
+        self._event("installing", {"slot": self._inactive_slot(),
+                                   "artifact_sha256": digest})
 
         if self.fail_install:
             version = self.slots[self.active_slot]
@@ -233,6 +317,8 @@ class SimDevice:
             )
             self._event("rollback_complete", {"rolled_back_to": version, "slot": self.active_slot})
             self._save_state()
+            # NOTE: watermark is NOT advanced — the new release never booted,
+            # so the same counter may legitimately be offered again later.
             return {"result": "failed", "rolled_back_to": version, "halted": res.get("halted_batch_ids", [])}
 
         target_version = self._offer["version"]
@@ -241,6 +327,12 @@ class SimDevice:
         self.active_slot = target_slot
         self.facts["current_version"] = target_version
         self._save_state()
+        # Advance the durable anti-rollback watermark in the same local
+        # success step (new slot is active and health-checked) BEFORE sending
+        # the receipt: a crash after this point still leaves both the slot and
+        # the watermark durable, and being one step ahead on the watermark is
+        # always safe (it only ever rejects older content).
+        self.trust.commit_accepted_release(claims.counter, self.trust.root_version)
         self._event("installed", {"version": target_version, "slot": target_slot})
         return {"result": "installed", "version": target_version}
 

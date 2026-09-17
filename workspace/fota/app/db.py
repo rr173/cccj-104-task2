@@ -42,6 +42,7 @@ def init_db() -> None:
     assert models is not None
 
     config.STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    config.KEYS_ROOT.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(engine)
 
 

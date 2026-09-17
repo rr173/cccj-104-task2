@@ -1,13 +1,14 @@
 """Operator-facing API: images, campaigns, staged batches, fleet/debug views."""
 from __future__ import annotations
 
+import json
 import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .. import config, rollout, storage
+from .. import config, rollout, storage, trust
 from ..db import get_session
 from ..models import (
     Assignment,
@@ -15,7 +16,10 @@ from ..models import (
     Campaign,
     Device,
     DeviceEvent,
+    FailureReceipt,
     Image,
+    ReleaseSignature,
+    TrustRoot,
     utcnow,
 )
 from ..schemas import (
@@ -25,9 +29,17 @@ from ..schemas import (
     CampaignIn,
     CampaignOut,
     DeviceOut,
+    FailureReceiptOut,
+    GenesisIn,
     ImageOut,
+    PublishSignedIn,
     RegisterIn,
+    ReleaseSignatureOut,
+    RotateRootIn,
+    SignReleaseIn,
+    TrustRootOut,
 )
+from ..security import normalize_root
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -57,6 +69,7 @@ async def upload_image(
     version: str = Form(...),
     min_bootloader: str | None = Form(default=None),
     max_bootloader: str | None = Form(default=None),
+    sign: bool = Form(default=True),
     db: Session = Depends(get_session),
 ) -> ImageOut:
     data = await file.read()
@@ -81,6 +94,15 @@ async def upload_image(
     db.add(img)
     db.commit()
     db.refresh(img)
+    # Every released artifact carries signed metadata. The first image for a
+    # model also bootstraps the v1 trust anchor (the demo convenience; in
+    # production genesis is created explicitly out of band before devices ship).
+    if sign:
+        try:
+            trust.ensure_genesis(db, model)
+            trust.sign_release(db, img)
+        except trust.TrustConflict as e:
+            raise HTTPException(status.HTTP_409_CONFLICT, e.reason)
     return img  # type: ignore[return-value]
 
 
@@ -257,6 +279,151 @@ def all_events(
         }
         for e in db.scalars(q).all()
     ]
+
+
+# ----- trust authority: genesis, rotation, signed releases, receipts -----
+def _trust_root_out(row: TrustRoot, *, duplicate: bool = False) -> TrustRootOut:
+    envelope = json.loads(row.envelope)
+    view = normalize_root(envelope["signed"])
+    return TrustRootOut(
+        model=row.model,
+        version=row.version,
+        state=row.state,
+        root_key_ids=sorted(view.root_keys),
+        signers={k: v["state"] for k, v in view.signers.items()},
+        expires=view.expires,
+        envelope=envelope,
+        duplicate=duplicate,
+    )
+
+
+@router.post("/trust/genesis", response_model=TrustRootOut, status_code=status.HTTP_201_CREATED)
+def create_genesis(body: GenesisIn, db: Session = Depends(get_session)) -> TrustRootOut:
+    try:
+        row, created = trust.ensure_genesis(
+            db, body.model, expires=body.expires_at, idempotency_key=body.idempotency_key
+        )
+    except trust.TrustError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, e.reason)
+    return _trust_root_out(row, duplicate=not created)
+
+
+@router.post("/trust/rotate", response_model=TrustRootOut)
+def rotate_root(body: RotateRootIn, db: Session = Depends(get_session)) -> TrustRootOut:
+    """Dual-authorized root-key rotation (old + new root sign). Committed in a
+    single transaction; retrying the same idempotency key converges."""
+    try:
+        row, created = trust.rotate_root(
+            db,
+            body.model,
+            expires=body.expires_at,
+            revoke_signer_ids=body.revoke_signer_ids,
+            add_signer=body.add_signer,
+            idempotency_key=body.idempotency_key,
+        )
+    except trust.TrustError as e:
+        code = status.HTTP_404_NOT_FOUND if e.reason == "no_genesis" else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(code, e.reason)
+    return _trust_root_out(row, duplicate=not created)
+
+
+@router.get("/trust/{model}/roots", response_model=list[TrustRootOut])
+def list_roots(model: str, db: Session = Depends(get_session)):
+    rows = db.scalars(
+        select(TrustRoot).where(TrustRoot.model == model).order_by(TrustRoot.version.asc())
+    ).all()
+    return [_trust_root_out(r) for r in rows]
+
+
+@router.get("/trust/{model}/status")
+def trust_status(model: str, db: Session = Depends(get_session)):
+    st = trust.genesis_status(db, model)
+    if st is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no_trust_anchor")
+    return st
+
+
+@router.post("/releases/sign", response_model=ReleaseSignatureOut)
+def sign_release(body: SignReleaseIn, db: Session = Depends(get_session)) -> ReleaseSignatureOut:
+    img = db.get(Image, body.image_id)
+    if img is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "image_not_found")
+    try:
+        if body.signer == "root":
+            rv = body.root_version
+            if rv is None:
+                latest = trust.latest_committed_root(db, img.model)
+                rv = latest.version if latest else 1
+            row, created = trust.sign_release_with_root_key(
+                db, img, root_version=rv, counter=body.counter,
+                expires=body.expires_at, idempotency_key=body.idempotency_key,
+            )
+        else:
+            kwargs = dict(counter=body.counter, expires=body.expires_at,
+                          idempotency_key=body.idempotency_key)
+            if body.ttl_days is not None:
+                kwargs["ttl_days"] = body.ttl_days
+            row, created = trust.sign_release(db, img, **kwargs)
+    except trust.TrustConflict as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, e.reason)
+    except trust.TrustError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, e.reason)
+    return ReleaseSignatureOut(
+        image_id=row.image_id, model=row.model, version=row.version,
+        counter=row.counter, expires=row.expires, keyid=row.keyid,
+        duplicate=not created, envelope=json.loads(row.envelope),
+    )
+
+
+@router.post("/releases/publish", response_model=ReleaseSignatureOut)
+def publish_signed(body: PublishSignedIn, db: Session = Depends(get_session)) -> ReleaseSignatureOut:
+    """Store metadata produced by an offline/air-gapped signing workstation."""
+    img = db.get(Image, body.image_id)
+    if img is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "image_not_found")
+    try:
+        row, created = trust.publish_envelope(
+            db, img, body.envelope, idempotency_key=body.idempotency_key
+        )
+    except trust.TrustConflict as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, e.reason)
+    except trust.TrustError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, e.reason)
+    return ReleaseSignatureOut(
+        image_id=row.image_id, model=row.model, version=row.version,
+        counter=row.counter, expires=row.expires, keyid=row.keyid,
+        duplicate=not created, envelope=json.loads(row.envelope),
+    )
+
+
+@router.get("/releases", response_model=list[ReleaseSignatureOut])
+def list_releases(model: str | None = None, db: Session = Depends(get_session)):
+    q = select(ReleaseSignature).order_by(ReleaseSignature.model, ReleaseSignature.counter)
+    if model:
+        q = q.where(ReleaseSignature.model == model)
+    return [
+        ReleaseSignatureOut(
+            image_id=r.image_id, model=r.model, version=r.version,
+            counter=r.counter, expires=r.expires, keyid=r.keyid,
+            envelope=json.loads(r.envelope),
+        )
+        for r in db.scalars(q).all()
+    ]
+
+
+@router.get("/rejections", response_model=list[FailureReceiptOut])
+def admin_list_rejections(
+    device_id: str | None = None,
+    reason: str | None = None,
+    limit: int = 200,
+    db: Session = Depends(get_session),
+):
+    q = select(FailureReceipt).order_by(FailureReceipt.created_at.desc()).limit(min(limit, 1000))
+    if device_id:
+        q = q.where(FailureReceipt.device_id == device_id)
+    if reason:
+        q = q.where(FailureReceipt.reason == reason)
+    return db.scalars(q).all()
 
 
 @router.get("/overview")

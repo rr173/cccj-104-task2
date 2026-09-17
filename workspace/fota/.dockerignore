@@ -3,3 +3,4 @@ __pycache__/
 .git/
 .pytest_cache/
 .data/
+.venv/

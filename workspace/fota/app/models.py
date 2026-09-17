@@ -172,3 +172,114 @@ class DeviceEvent(Base):
     __table_args__ = (
         UniqueConstraint("device_id", "idempotency_key", name="uq_event_device_idem"),
     )
+
+
+# --- signed release trust -----------------------------------------------------
+# Root version lifecycle. A rotation is written committed in ONE transaction:
+# there is deliberately no long-lived intermediate state, so a crash can never
+# expose a half-applied root. The state column exists to make the two-phase
+# intent explicit and to reject stray rows in audits.
+ROOT_PENDING = "pending"
+ROOT_COMMITTED = "committed"
+ROOT_SUPERSEDED = "superseded"
+
+
+class TrustRoot(Base):
+    """One versioned, signed root document for a device model.
+
+    v1 is the trust anchor (registered out of band); each subsequent row is a
+    dual-authorized transition (signed by both the retiring and the incoming
+    root key). Devices walk committed versions consecutively.
+    """
+    __tablename__ = "trust_roots"
+
+    model: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    envelope: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default=ROOT_COMMITTED)
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("model", "idempotency_key", name="uq_root_model_idem"),
+        Index("ix_trust_root_model_state", "model", "state"),
+    )
+
+
+class ReleaseSignature(Base):
+    """Deterministically serialized, signed metadata for one image.
+
+    ``counter`` is the per-model monotonically increasing security counter a
+    device uses for downgrade resistance; (model, version) and (model, counter)
+    are unique so two different binaries can never claim the same release
+    version and trust state can never be lowered.
+    """
+    __tablename__ = "release_signatures"
+
+    image_id: Mapped[str] = mapped_column(
+        ForeignKey("images.id"), primary_key=True
+    )
+    model: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    counter: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    keyid: Mapped[str] = mapped_column(String(64), nullable=False)
+    envelope: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("model", "version", name="uq_release_model_version"),
+        UniqueConstraint("model", "counter", name="uq_release_model_counter"),
+        UniqueConstraint("model", "idempotency_key", name="uq_release_model_idem"),
+    )
+
+
+class DeviceTrustState(Base):
+    """Durable per-device anti-rollback watermark. Survives process restarts:
+    a release whose signed counter is not strictly above ``highest_counter``
+    is refused before any critical write."""
+    __tablename__ = "device_trust_state"
+
+    device_id: Mapped[str] = mapped_column(ForeignKey("devices.id"), primary_key=True)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    root_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    highest_counter: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class FailureReceipt(Base):
+    """Durable, queryable record of a release/trust rejection.
+
+    Written when a device refuses content BEFORE the critical write phase, so
+    the active boot slot is untouched. Retries carry the same stable
+    idempotency key and therefore converge to this single row.
+    """
+    __tablename__ = "failure_receipts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    assignment_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    image_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    image_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    counter_seen: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    root_version_seen: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Stable machine-readable TrustError reason (release_expired, revoked_signer,
+    # counter_rollback, artifact_digest_mismatch, root_chain_gap, ...).
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Where in the pipeline rejection happened (checkin/download/pre_flash).
+    stage: Mapped[str] = mapped_column(String(32), nullable=False, default="pre_flash")
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    resolved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("device_id", "idempotency_key", name="uq_receipt_device_idem"),
+        Index("ix_receipt_device_created", "device_id", "created_at"),
+        Index("ix_receipt_reason", "reason"),
+    )

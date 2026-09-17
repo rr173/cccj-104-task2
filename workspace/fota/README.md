@@ -143,9 +143,64 @@ device_events(id, device_id, assignment_id, event_type, idempotency_key,
               from_state, to_state, payload)           -- UNIQUE(device,idempotency_key)
 ```
 
+## 离线签名、防降级与根密钥轮换（FOTA 信任层）
+
+在“分块校验”之上新增一套 **Ed25519 离线签名 + 版本化根链 + 单调安全计数器**
+信任层（`app/security/` 为纯逻辑，终端侧 `client/trust.py` 复用同一套验签代码）。
+
+### 1. 确定性序列化的签名元数据
+每个发布都带一份**规范化 JSON**（`app/security/canonical.py`：UTF-8 键排序、
+固定分隔符、UTC `Z` 时间）的 detached 签名信封
+`{"signed":{...},"signatures":[{"keyid","sig"}]}`，`release` 文档覆盖：
+
+- `artifact_digest`（`sha256:<hex>`，与分块整包摘要严格绑定）
+- `model`（设备型号）、`version`（展示版本）
+- `counter`（该型号**单调递增**安全计数器）、`expires`（过期时刻）
+
+签名只对规范化字节生效；改动任何字段都会使签名失效。上传镜像默认自动用离线
+委托签名者签发（也可 `sign=false` 后走 `/api/admin/releases/publish` 上传
+空气隔离工作站签好的信封）。
+
+### 2. 终端进入关键写阶段前的完整校验
+设备在整包 sha256 通过后、**刷写开始前**（`downloaded → installing` 边界）校验：
+信任链 → 签名 → 过期 → 工件摘要 → 型号/展示版本 → 计数器。服务端在同一 FSM
+边界用同样的逻辑做**权威二次校验**（`rollout._enforce_critical_trust_gate`），
+因此被篡改/老旧客户端也无法绕过。任一失败：
+
+- **不触碰活动槽**，旧槽保持可启动（assignment 停在 `downloaded`）；
+- 落一条**持久、可查询**的失败回执（`failure_receipts`，设备端
+  `/api/device/rejections` 上报 + 服务端网关自动留档）；
+- 回执带每 (设备, 发布, 拒绝类别) 稳定的幂等键，**重试只产生一行结果**。
+
+### 3. 防降级（单调安全计数器）
+`device_trust_state` 持久化每设备 `highest_counter`，**只在新槽健康启动确认后**
+推进；计数器 ≤ 已接受最高值一律 `counter_rollback` 拒绝。状态落库 + 终端落盘，
+跨进程/断电重启保持（有独立的双进程重启测试）。
+
+### 4. 根密钥轮换：旧根 + 新根双授权
+`root` 文档按型号版本化：v1 为出厂信任锚；之后每一代 N 必须同时由
+**vN-1 声明的旧根密钥**与 **vN 声明的新根密钥**签名。轮换在**单事务**内
+完成“插入新根 + 旧根置 superseded”，崩溃只可能落在旧态或新态，永无半应用。
+历史版本全部保留，离线设备可在**一次唤醒内连续走过 v2,v3,v4…**；缺任何一环、
+签名不符、过期、版本回退、被吊销签名者都 **fail closed**，且整链“先全验证、
+后一次性落盘”。被吊销签名者**永不允许复活**（`revoked_signer_reactivated`）。
+
+- 管理端：`POST /api/admin/trust/genesis`、`POST /api/admin/trust/rotate`
+  （带 `idempotency_key`，同键并发/重试只产生一个结果）、
+  `GET /api/admin/trust/{model}/roots|/status`、`POST /api/admin/releases/sign|publish`。
+- 轮换幂等：新根/新签名者密钥由 `(model, version, idempotency_key)` 派生，
+  崩溃后用同一键重试会重建完全一致的材料并返回 `duplicate:true`，收敛到同一根。
+- 切根后，仅由退役根密钥签名的内容因其 keyid 已不在新根文档中而被
+  `untrusted_signer` 拒绝（委托签名者与根密钥相互独立）。
+
+### 5. 与既有行为的关系
+信任层叠加在原 FSM 之上，不改变 rollout/pause/breaker/resume/rollback 语义：
+暂停/熔断对未进关键区的设备照旧拦截，已进关键区（installing）的设备照旧安全
+收尾；原 27 项测试全部保持，新增 28 项信任测试。
+
 ## 验证矩阵
 
-`docker run --rm fota-service:dev test -v` 或本地 `pytest -v`（26 项）：
+`docker run --rm fota-service:dev test -v` 或本地 `pytest -v`（55 项）：
 
 | 关注点 | 测试文件 |
 |---|---|
@@ -155,10 +210,17 @@ device_events(id, device_id, assignment_id, event_type, idempotency_key,
 | 暂停拦截、关键区收尾、级联、force 恢复 | `tests/test_pause_halt.py` |
 | 越阈熔断、级联停扩散、阈值边界、原因留档 | `tests/test_failure_halt.py` |
 | 回执重放、8 路并发重复上线、名额竞争、乱序拒绝 | `tests/test_idempotency.py` |
+| 初始根发布安装、确定性元数据、重启后水印 | `tests/test_trust_happy_path.py` |
+| 改元数据/改块拒绝、旧槽可启动、回执幂等可查 | `tests/test_trust_tamper.py` |
+| 过期、吊销签名者、计数器回滚（端+权威网关） | `tests/test_trust_expiry_revocation.py` |
+| 多代轮换、缺链 fail-closed、崩溃收敛、并发同键、版本冲突、退役根拒绝 | `tests/test_trust_rotation.py` |
+| 暂停/关键区收尾与签名层组合不回归 | `tests/test_trust_compose_pause.py` |
+| 水印/根链/回执跨**真实进程重启**保持 | `tests/test_trust_restart.py` |
 
 真实 HTTP 进程端到端（非 TestClient）也已验证：断 1 块后唤醒只拉剩余块、
 暂停中途唤醒返回 `batch_paused`、恢复后续传并安装、2/2 失败自动熔断并级联阶段 3、
-失败设备影子版本回滚、安装成功版本跨进程重启保持。
+失败设备影子版本回滚、安装成功版本跨进程重启保持；签名层另验证了实时
+uvicorn 下初始根安装、离线设备一次唤醒穿越 v1→v2、切根后退役根签名被拒。
 
 ## 配置（环境变量）
 
@@ -166,15 +228,17 @@ device_events(id, device_id, assignment_id, event_type, idempotency_key,
 |---|---|---|
 | `DATABASE_URL` | 本地 sqlite | SQLAlchemy URL；生产建议 Postgres |
 | `STORAGE_ROOT` | `.data/artifacts` | 分块镜像存储目录（compose 挂卷 `/data`） |
+| `KEYS_ROOT` | `.data/keys` | 离线签名根/委托签名者私钥目录（生产须空气隔离/加密；compose 挂卷 `/data`） |
 | `CHUNK_SIZE` | 262144 | 块大小（字节） |
 | `FAILURE_THRESHOLD` / `FAILURE_MIN_SAMPLE` | 0.2 / 3 | 批次默认熔断阈值与最小样本 |
-| `SEED_DEMO` | false | 启动时种入一个演示镜像 + 金丝雀批次（compose 开启） |
+| `SEED_DEMO` | false | 启动时种入一个已签名演示镜像 + 金丝雀批次（compose 开启） |
 
 ## 生产化备注（本实现刻意留出的边界）
 
 - 鉴权：管理端应加运营 SSO/角色，设备端用设备证书/签名令牌（当前为裸 header，便于演示）。
-- 镜像安全：已做传输与落盘完整性（sha256），上线前应加**发布签名验签**（如 ed25519/minisign），
-  终端刷写前校验签名而不仅是哈希。
+- 签名密钥：参考实现把 Ed25519 私钥放在 `KEYS_ROOT/keyring.json` 以便端到端可运行；
+  生产中根私钥必须留在空气隔离/HSM，服务端只持有公钥，走
+  `/api/admin/releases/publish` 上传播放（离线签发）工作流。
 - 规模：单 worker + 进程锁 + sqlite 用于可复现演示；多实例部署切 Postgres，
   将名额领取改为批次行 `SELECT … FOR UPDATE`，块对象放 S3/CDN（块内容寻址且 immutable，可直接缓存）。
 - 回执可加老化归档；`assignments` 建议按 (campaign, device) 分区。

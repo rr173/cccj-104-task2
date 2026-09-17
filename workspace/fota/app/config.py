@@ -18,6 +18,10 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL", "sqlite:///" + str(Path(__file__).resolve().parent.parent / ".data" / "fota.db")
 )
 STORAGE_ROOT = Path(os.environ.get("STORAGE_ROOT", str(Path(__file__).resolve().parent.parent / ".data" / "artifacts")))
+# Offline signing material (Ed25519 root + delegated signer seeds). Keep this
+# directory air-gapped/encrypted in production; the default only keeps the
+# reference demo reproducible.
+KEYS_ROOT = Path(os.environ.get("KEYS_ROOT", str(Path(__file__).resolve().parent.parent / ".data" / "keys")))
 
 # Artifact is split into fixed-size blocks; resume works at block granularity.
 CHUNK_SIZE = _int("CHUNK_SIZE", 256 * 1024)
